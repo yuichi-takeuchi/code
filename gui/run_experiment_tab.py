@@ -71,39 +71,44 @@ class Run_experiment_tab(QtGui.QWidget):
         self.update_timer = QtCore.QTimer() # Timer to regularly call update() during run.        
         self.update_timer.timeout.connect(self.update)
 
-    # Functions called by setup experiment.
+    # Functions used for multithreaded experiment setup.
 
-    def print_to_logs(self, print_str):
-        '''Print to all subjectbox logs.'''
-        for subjectbox in self.subjectboxes:
-            subjectbox.print_to_log(print_str)
+    def thread_map(self, func):
+        '''Map func over range(self.n_setups) using seperate threads for each call.
+        Used to run experiment setup functions on all boards in parallel.'''
+        with ThreadPoolExecutor(max_workers=self.n_setups) as executor:
+            return executor.map(func, range(self.n_setups))
 
     def connect_to_board(self, i):
-        '''Connect to the i-th board in the experiment'''
+        '''Connect to the i-th board.'''
         setup = self.setup_order[i]
         print_func = self.subjectboxes[i].print_to_log
         serial_port = self.GUI_main.setups_tab.get_port(setup)
         try:
             board = Pycboard(serial_port, print_func=print_func)
         except SerialException:
-            print_func('Connection failed.')
-            return False
+            print_func('\nConnection failed.')
+            self.setup_failed[i] = True
+            return
         if not board.status['framework']:
             print_func('\nInstall pyControl framework on board before running experiment.')
-            return False        
+            self.setup_failed[i] = True    
         board.subject = self.experiment['subjects'][setup]
         return board
 
     def start_hardware_test(self, i):
-        '''Start hardware test on i-th setup'''
-        board = self.boards[i]
-        board.setup_state_machine(self.experiment['hardware_test'])
-        board.start_framework(data_output=False)
-        time.sleep(0.01)
-        board.process_data()
+        '''Start hardware test on i-th board'''
+        try:
+            board = self.boards[i]
+            board.setup_state_machine(self.experiment['hardware_test'])
+            board.start_framework(data_output=False)
+            time.sleep(0.01)
+            board.process_data()
+        except PyboardError:
+            self.setup_failed[i] = True
 
     def setup_task(self, i):
-        '''Load the task state machine and set variables on i-th setup.'''
+        '''Load the task state machine and set variables on i-th board.'''
         board = self.boards[i]
         # Setup task state machine.
         try:
@@ -111,7 +116,8 @@ class Run_experiment_tab(QtGui.QWidget):
                 [self.experiment_plot.subject_plots[i], self.subjectboxes[i]])
             board.setup_state_machine(self.experiment['task'])
         except PyboardError:
-            return False
+            self.setup_failed[i] = True
+            return
         # Set variables.
         board.subject_variables = [v for v in self.experiment['variables'] 
                                    if v['subject'] in ('all', board.subject)]
@@ -143,9 +149,8 @@ class Run_experiment_tab(QtGui.QWidget):
                             v_name.ljust(name_len+4) + v_value.ljust(value_len+4) + pv_str)
             except PyboardError as e:
                 board.print('Setting variable failed. ' + str(e))
-                self.subjectboxes[i].error()
-                return False
-        return True
+                self.setup_failed[i] = True
+        return
 
     def setup_experiment(self, experiment):
         '''Called when an experiment is loaded.'''
@@ -155,7 +160,7 @@ class Run_experiment_tab(QtGui.QWidget):
         self.experiment = experiment
         self.setup_order = sorted(experiment['subjects'].keys())
         self.GUI_main.tab_widget.setTabEnabled(0, False) # Disable run task tab.
-        self.GUI_main.tab_widget.setTabEnabled(2, False)  # Disable setups tab.
+        self.GUI_main.tab_widget.setTabEnabled(2, False) # Disable setups tab.
         self.GUI_main.experiments_tab.setCurrentWidget(self)
         self.startstopclose_button.setText('Start')
         self.experiment_plot.setup_experiment(experiment)
@@ -186,39 +191,42 @@ class Run_experiment_tab(QtGui.QWidget):
         self.GUI_main.app.processEvents()
         # Setup boards.
         self.print_to_logs('Connecting to board.. ')
-        n_setups = len(self.setup_order)
-        with ThreadPoolExecutor(max_workers=n_setups) as executor:
-            self.boards = [b for b in executor.map(
-                self.connect_to_board, range(n_setups))]
-        if not all(self.boards):
+        self.n_setups = len(self.setup_order)
+        self.setup_failed = [False] * self.n_setups # Element i set to True to indicate setup has failed on board i.
+        self.boards = [board for board in self.thread_map(self.connect_to_board)]
+        if any(self.setup_failed):
             self.abort_experiment()
+            return
         # Hardware test.
         if experiment['hardware_test'] != 'no hardware test':
             reply = QtGui.QMessageBox.question(self, 'Hardware test', 'Run hardware test?',
                 QtGui.QMessageBox.Yes | QtGui.QMessageBox.No)
             if reply == QtGui.QMessageBox.Yes:
                 self.print_to_logs('\nStarting hardware test.')
-                try:
-                    with ThreadPoolExecutor(max_workers=n_setups) as executor:
-                        executor.map(self.start_hardware_test, range(n_setups))
-                    QtGui.QMessageBox.question(self, 'Hardware test', 
-                        'Press OK when finished with hardware test.', QtGui.QMessageBox.Ok)
-                    for i, board in enumerate(self.boards):
+                self.thread_map(self.start_hardware_test)
+                if any(self.setup_failed):
+                    self.abort_experiment()
+                    return
+                QtGui.QMessageBox.question(self, 'Hardware test', 
+                    'Press OK when finished with hardware test.', QtGui.QMessageBox.Ok)
+                for i, board in enumerate(self.boards):
+                    try:
                         board.stop_framework()
                         time.sleep(0.05)
                         board.process_data()
-                except PyboardError as e:
-                    board.print('\n' + str(e))
-                    self.subjectboxes[i].error()
+                    except PyboardError as e:
+                        self.setup_failed[i] = True
+                        board.print('\n' + str(e))
+                        self.subjectboxes[i].error()
+                if any(self.setup_failed):
                     self.abort_experiment()
                     return
         # Setup task
         self.print_to_logs('\nSetting up task.')
-        with ThreadPoolExecutor(max_workers=n_setups) as executor:
-            setup_OK = [ok for ok in executor.map(
-                self.setup_task, range(n_setups))]
-        if not all(setup_OK):
+        self.thread_map(self.setup_task)
+        if any(self.setup_failed):
             self.abort_experiment()
+            return
         # Copy task file to experiments data folder.
         self.boards[0].data_logger.copy_task_file(self.experiment['data_dir'], dirs['tasks'])
         # Configure GUI ready to run.
@@ -299,8 +307,10 @@ class Run_experiment_tab(QtGui.QWidget):
         self.update_timer.stop()
         self.GUI_main.refresh_timer.start(self.GUI_main.refresh_interval)
         for i, board in enumerate(self.boards):
+            if self.setup_failed[i]:
+                    self.subjectboxes[i].error()
             # Stop running boards.
-            if board.framework_running:
+            if board and board.framework_running:
                 board.stop_framework()
                 time.sleep(0.05)
                 board.process_data()
@@ -314,8 +324,10 @@ class Run_experiment_tab(QtGui.QWidget):
         self.experiment_plot.close_experiment()
         # Close boards.
         for board in self.boards:
-            if board.data_logger: board.data_logger.close_files()
-            board.close()
+            if board:
+                if board.data_logger:
+                    board.data_logger.close_files()
+                board.close()
         # Clear subjectboxes.
         while len(self.subjectboxes) > 0:
             subjectbox = self.subjectboxes.pop() 
@@ -363,6 +375,11 @@ class Run_experiment_tab(QtGui.QWidget):
         self.experiment_plot.update()
         if not boards_running:
             self.stop_experiment()
+
+    def print_to_logs(self, print_str):
+        '''Print to all subjectbox logs.'''
+        for subjectbox in self.subjectboxes:
+            subjectbox.print_to_log(print_str)
 
 # -----------------------------------------------------------------------------
 
