@@ -258,8 +258,9 @@ class Run_experiment_tab(QtGui.QWidget):
         self.update_timer.start(update_interval)
 
     def stop_experiment(self):
-        self.status_text.setText('Stopped')
+        self.startstopclose_button.setEnabled(False)
         self.startstopclose_button.setText('Close')
+        self.status_text.setText('Stopped')
         self.state = 'post_run'
         self.update_timer.stop()
         self.GUI_main.refresh_timer.start(self.GUI_main.refresh_interval)
@@ -297,6 +298,7 @@ class Run_experiment_tab(QtGui.QWidget):
                 pv_file.write(json.dumps(persistent_variables, sort_keys=True, indent=4))
         if summary_variables:
             Summary_variables_dialog(self, sv_dict).show()
+        self.startstopclose_button.setEnabled(True)
 
     def abort_experiment(self):
         '''Called if an error occurs while the experiment is being set up.'''
